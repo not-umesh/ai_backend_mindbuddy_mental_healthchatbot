@@ -1,0 +1,11 @@
+# Render deployment configuration
+# This file tells Render how to build and run your app
+
+# Build command
+build: npm install
+
+# Start command  
+start: npm start
+
+# Environment
+NODE_ENV: production

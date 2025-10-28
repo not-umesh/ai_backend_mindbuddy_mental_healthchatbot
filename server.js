@@ -89,6 +89,52 @@ app.get('/api', (req, res) => {
   });
 });
 
+// Utility: small sleep
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Call OpenAI with simple exponential backoff on 429/5xx
+async function callOpenAIWithRetry({ apiKey, messages, maxTokens = 150, temperature = 0.7, maxAttempts = 2 }) {
+  let attempt = 0;
+  let lastError;
+  while (attempt < maxAttempts) {
+    try {
+      const resp = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-4o-mini',
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+          presence_penalty: 0.5,
+          frequency_penalty: 0.5,
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          timeout: 10000,
+        }
+      );
+      return resp;
+    } catch (err) {
+      lastError = err;
+      const status = err?.response?.status;
+      // Retry on rate limit (429) and transient server errors (>=500)
+      if (status === 429 || (status >= 500 && status <= 599)) {
+        const backoffMs = 500 * Math.pow(2, attempt); // 500ms, 1000ms
+        await sleep(backoffMs);
+        attempt++;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
 // Chat endpoint
 app.post('/api/chat', async (req, res) => {
   try {
@@ -115,25 +161,14 @@ app.post('/api/chat', async (req, res) => {
     // Build context messages
     const contextMessages = buildContextMessages(chatHistory, message);
 
-    // Call OpenAI API
-    const openaiResponse = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: contextMessages,
-        max_tokens: 150,
-        temperature: 0.7,
-        presence_penalty: 0.5,
-        frequency_penalty: 0.5,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${openaiApiKey}`,
-        },
-        timeout: 10000, // 10 second timeout
-      }
-    );
+    // Call OpenAI API with retry
+    const openaiResponse = await callOpenAIWithRetry({
+      apiKey: openaiApiKey,
+      messages: contextMessages,
+      maxTokens: 150,
+      temperature: 0.7,
+      maxAttempts: 2,
+    });
 
     if (openaiResponse.status === 200) {
       const aiResponse = openaiResponse.data.choices[0].message.content.trim();
@@ -147,18 +182,23 @@ app.post('/api/chat', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Chat error:', error.message);
+    const status = error?.response?.status;
+    const errMsg = error?.response?.data || error.message;
+    console.error('Chat error:', status || '', errMsg);
     
     // Determine if it's an API key issue or network issue
     let responseMessage;
     let source = 'fallback';
     
-    if (error.message.includes('account_deactivated') || 
-        error.message.includes('invalid_api_key') ||
-        error.message.includes('401')) {
+    if (String(errMsg).includes('account_deactivated') || 
+        String(errMsg).includes('invalid_api_key') ||
+        String(errMsg).includes('401')) {
       responseMessage = "My AI brain is taking a break right now, but I'm still here to chat!";
       source = 'api_key_issue';
-    } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+    } else if (status === 429) {
+      responseMessage = getRandomResponse(offlineResponses);
+      source = 'rate_limited';
+    } else if (error.code === 'ECONNABORTED' || String(errMsg).includes('timeout')) {
       responseMessage = getRandomResponse(offlineResponses);
       source = 'timeout';
     } else {
@@ -168,7 +208,8 @@ app.post('/api/chat', async (req, res) => {
     return res.json({
       response: responseMessage,
       source: source,
-      error: error.message,
+      error: typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg),
+      status: status || null,
       timestamp: new Date().toISOString()
     });
   }

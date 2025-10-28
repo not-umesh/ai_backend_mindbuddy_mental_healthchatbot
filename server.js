@@ -62,6 +62,33 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Root endpoint (helpful landing response)
+app.get('/', (req, res) => {
+  res.json({
+    name: 'MindBuddy Backend',
+    status: 'OK',
+    message: 'Welcome! Use the endpoints below.',
+    endpoints: {
+      health: '/health',
+      status: '/api/status',
+      chat: '/api/chat'
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+// API base endpoint
+app.get('/api', (req, res) => {
+  res.json({
+    message: 'MindBuddy API base. Try /api/status or POST /api/chat',
+    endpoints: {
+      status: '/api/status',
+      chat: '/api/chat'
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Chat endpoint
 app.post('/api/chat', async (req, res) => {
   try {

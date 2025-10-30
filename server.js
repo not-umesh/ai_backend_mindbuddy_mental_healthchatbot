@@ -53,6 +53,34 @@ const fallbackResponses = [
   "Some server drama, but I'm still your buddy!"
 ];
 
+// Utility: small sleep
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Generic retry helper for HTTP calls (429/5xx)
+async function httpPostWithRetry({ url, data, headers, timeout = 10000, maxAttempts = 2 }) {
+  let attempt = 0;
+  let lastError;
+  while (attempt < maxAttempts) {
+    try {
+      const resp = await axios.post(url, data, { headers, timeout });
+      return resp;
+    } catch (err) {
+      lastError = err;
+      const status = err?.response?.status;
+      if (status === 429 || (status >= 500 && status <= 599)) {
+        const backoffMs = 500 * Math.pow(2, attempt); // 500ms, 1000ms
+        await sleep(backoffMs);
+        attempt++;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
@@ -146,40 +174,89 @@ app.post('/api/chat', async (req, res) => {
       });
     }
 
-    // Check if OpenAI API key is configured
+    // Prefer OpenRouter if configured, otherwise OpenAI, else offline
+    const openrouterKey = process.env.OPENROUTER_API_KEY;
+    const openrouterModel = process.env.OPENROUTER_MODEL || 'meituan/longcat-flash-chat:free';
+    const openrouterSite = process.env.OPENROUTER_SITE || 'https://mindbuddy.app';
+    const openrouterTitle = process.env.OPENROUTER_TITLE || 'MindBuddy';
     const openaiApiKey = process.env.OPENAI_API_KEY;
-    
-    if (!openaiApiKey || openaiApiKey === 'your-openai-api-key-here') {
-      console.log('OpenAI API key not configured, using offline response');
-      return res.json({
-        response: getRandomResponse(offlineResponses),
-        source: 'offline',
-        timestamp: new Date().toISOString()
-      });
-    }
 
     // Build context messages
     const contextMessages = buildContextMessages(chatHistory, message);
 
-    // Call OpenAI API with retry
-    const openaiResponse = await callOpenAIWithRetry({
-      apiKey: openaiApiKey,
-      messages: contextMessages,
-      maxTokens: 150,
-      temperature: 0.7,
-      maxAttempts: 2,
-    });
-
-    if (openaiResponse.status === 200) {
-      const aiResponse = openaiResponse.data.choices[0].message.content.trim();
-      return res.json({
-        response: aiResponse,
-        source: 'openai',
-        timestamp: new Date().toISOString()
+    if (openrouterKey) {
+      // Call OpenRouter first
+      const orResp = await httpPostWithRetry({
+        url: 'https://openrouter.ai/api/v1/chat/completions',
+        data: {
+          model: openrouterModel,
+          messages: contextMessages,
+          max_tokens: 150,
+          temperature: 0.7,
+          presence_penalty: 0.5,
+          frequency_penalty: 0.5,
+        },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openrouterKey}`,
+          'HTTP-Referer': openrouterSite,
+          'X-Title': openrouterTitle,
+        },
+        timeout: 12000,
+        maxAttempts: 2,
       });
-    } else {
-      throw new Error(`OpenAI API error: ${openaiResponse.status}`);
+
+      if (orResp.status === 200) {
+        const aiResponse = orResp.data.choices?.[0]?.message?.content?.trim() || '';
+        if (aiResponse) {
+          return res.json({
+            response: aiResponse,
+            source: 'openrouter',
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+      // If no usable response, fall through to OpenAI/offline
     }
+
+    if (openaiApiKey) {
+      // Call OpenAI as fallback
+      const openaiResponse = await httpPostWithRetry({
+        url: 'https://api.openai.com/v1/chat/completions',
+        data: {
+          model: 'gpt-4o-mini',
+          messages: contextMessages,
+          max_tokens: 150,
+          temperature: 0.7,
+          presence_penalty: 0.5,
+          frequency_penalty: 0.5,
+        },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiApiKey}`,
+        },
+        timeout: 10000,
+        maxAttempts: 2,
+      });
+
+      if (openaiResponse.status === 200) {
+        const aiResponse = openaiResponse.data.choices[0].message.content.trim();
+        return res.json({
+          response: aiResponse,
+          source: 'openai',
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        throw new Error(`OpenAI API error: ${openaiResponse.status}`);
+      }
+    }
+
+    // Neither provider configured: offline
+    return res.json({
+      response: getRandomResponse(offlineResponses),
+      source: 'offline',
+      timestamp: new Date().toISOString()
+    });
 
   } catch (error) {
     const status = error?.response?.status;
@@ -190,14 +267,14 @@ app.post('/api/chat', async (req, res) => {
     let responseMessage;
     let source = 'fallback';
     
-    if (String(errMsg).includes('account_deactivated') || 
+    if (String(errMsg).includes('insufficient_quota') || status === 429) {
+      responseMessage = getRandomResponse(offlineResponses);
+      source = 'rate_limited';
+    } else if (String(errMsg).includes('account_deactivated') || 
         String(errMsg).includes('invalid_api_key') ||
         String(errMsg).includes('401')) {
       responseMessage = "My AI brain is taking a break right now, but I'm still here to chat!";
       source = 'api_key_issue';
-    } else if (status === 429) {
-      responseMessage = getRandomResponse(offlineResponses);
-      source = 'rate_limited';
     } else if (error.code === 'ECONNABORTED' || String(errMsg).includes('timeout')) {
       responseMessage = getRandomResponse(offlineResponses);
       source = 'timeout';
@@ -236,15 +313,19 @@ function buildContextMessages(chatHistory, userMessage) {
   // System prompt for English-first, India-focused responses
   messages.push({
     role: 'system',
-    content: `You are MindBuddy, an English-first AI companion for Indian youth.
-Always reply in simple, clear English unless the user types in Hindi—then you can use friendly Hinglish back.
-Never use pure Hindi unless the user clearly does.
-Keep responses SHORT (2-3 sentences max).
-Don't mention anything you CAN'T do (calling, sending files, meeting physically).
-If the user seems stressed, give brief, practical advice that Indian young people relate to.
-Use Hindi words sparingly for flavor only (yaar, bhai, dost, chill, scene).
-Stay casual, friendly, and never preachy or robotic.
-Reference past chats naturally when relevant.`
+    content: `You are MindBuddy. You are a real friend, texting the user directly.
+— Speak naturally, like a smart, emotionally aware person (not an AI, not a therapist).
+— Use contractions ("don’t", "can’t", etc.).
+— Avoid all formal/counselor templates. Never say “I understand how you feel,” “I’m here for you,” or similar phrases.
+— If the user is being unrealistic or overthinking, use gentle logic or subtle humor to ground them—don’t sugarcoat, but don’t be mean.
+— Make every reply context-aware and non-repetitive.
+— Avoid formal language and words like “therapy,” “diagnosis,” or “treatment.”
+— If you comfort someone, keep it casual, not clinical.
+— If you notice illogical or self-critical spirals, call them out kindly.
+— If the user makes progress, acknowledge it briefly without fake praise.
+— Never repeat templates. Each reply should be unique and adapt to the user's real energy.
+— Prioritize reasoning, insight, and real conversation, not empty motivation.
+— Responses should be concise, text-message length, but never rushed or dismissive.`
   });
 
   // Add recent chat history (last 10 messages)
